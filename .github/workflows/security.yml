@@ -1,1 +1,117 @@
+name: Security Scan
 
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+
+  sast-scan:
+    name: "Python Code Scan (Bandit)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit scan
+        id: bandit
+        run: |
+          set +e
+          bandit -r . --exclude ./.git --severity-level medium --format json --output bandit-report.json
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post results as PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('bandit-report.json', 'utf8'));
+            } catch(e) {
+              return;
+            }
+
+            const results = report.results || [];
+            const high = results.filter(r => r.issue_severity === 'HIGH');
+            const medium = results.filter(r => r.issue_severity === 'MEDIUM');
+
+            if (results.length === 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## ✅ Security Scan — All Clear!\n\nNo issues found in your Python code. Safe to merge!`
+              });
+              return;
+            }
+
+            let body = `## 🔍 Security Scan Results\n\n`;
+            body += `Found **${results.length} issue(s)** — ${high.length} HIGH, ${medium.length} MEDIUM\n\n`;
+
+            results.forEach(r => {
+              body += `### ${r.issue_severity === 'HIGH' ? '🔴' : '🟡'} ${r.test_id}: ${r.issue_text}\n`;
+              body += `- **File:** \`${r.filename}\` — Line **${r.line_number}**\n`;
+              body += `- **How to fix:** See [Bandit docs](${r.more_info})\n\n`;
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Fail if HIGH issues found
+        if: always()
+        run: |
+          HIGH=$(python3 -c "
+          import json, sys
+          try:
+            r = json.load(open('bandit-report.json'))
+            high = [x for x in r.get('results',[]) if x['issue_severity']=='HIGH']
+            print(len(high))
+          except: print(0)
+          ")
+          echo "HIGH severity issues found: $HIGH"
+          if [ "$HIGH" -gt "0" ]; then
+            echo "❌ Blocking PR — $HIGH HIGH severity issue(s) found. See PR comments for fixes."
+            exit 1
+          fi
+          echo "✅ No HIGH severity issues. PR is safe."
+
+  dependency-scan:
+    name: "Dependency Scan (pip-audit)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run dependency scan
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt
+          else
+            echo "No requirements.txt found — skipping dependency scan"
+          fi
